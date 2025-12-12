@@ -1,0 +1,5 @@
+{
+  "name": "Travel Buddy AI",
+  "description": "An AI-powered travel assistant that identifies landmarks from photos and generates personalized itineraries, history, and cultural insights using Gemini Vision.",
+  "requestFramePermissions": []
+}
