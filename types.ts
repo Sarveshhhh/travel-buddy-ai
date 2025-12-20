@@ -6,7 +6,7 @@ export interface LandmarkData {
   country: string;
   confidenceScore: number;
   description: string;
-  descriptionPoints: string[]; // New: Bullet points for overview
+  descriptionPoints: string[]; 
   tags: string[];
   imageBase64: string;
 }
@@ -46,12 +46,19 @@ export interface ItineraryStep {
   durationMinutes: number;
   whyVisit: string;
   tip: string;
+  isHiddenGem?: boolean;
+}
+
+export interface ItineraryDay {
+  dayNumber: number;
+  dayTitle: string;
+  steps: ItineraryStep[];
 }
 
 export interface ItineraryData {
   title: string;
-  totalDuration: string;
-  steps: ItineraryStep[];
+  totalDays: number;
+  days: ItineraryDay[];
 }
 
 export interface CultureData {

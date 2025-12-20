@@ -1,14 +1,261 @@
-import { GoogleGenAI, Type, Schema } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import { LandmarkData, HistoryData, NearbyPlace, ItineraryData, CultureData, EventData, LogisticsData, DeepDiveData, Attraction } from "../types";
 
-const apiKey = process.env.API_KEY || '';
-const ai = new GoogleGenAI({ apiKey });
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-const modelId = "gemini-2.5-flash";
+const modelId = "gemini-3-flash-preview";
+
+/**
+ * Utility to retry failed API calls, specifically targeting 429 Resource Exhausted errors.
+ * Uses exponential backoff.
+ */
+async function withRetry<T>(fn: () => Promise<T>, retries = 3, delay = 2000): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: any) {
+    const isRateLimit = error?.status === 429 || 
+                       error?.message?.toLowerCase().includes("quota") || 
+                       error?.message?.toLowerCase().includes("rate limit") ||
+                       error?.message?.toLowerCase().includes("exhausted");
+    
+    if (retries > 0 && isRateLimit) {
+      console.warn(`Rate limit hit. Retrying in ${delay}ms... (${retries} attempts left)`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return withRetry(fn, retries - 1, delay * 2);
+    }
+    throw error;
+  }
+}
+
+const extractJSON = (text: string) => {
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    const jsonMatch = text.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+    if (jsonMatch) {
+      try {
+        return JSON.parse(jsonMatch[0]);
+      } catch (innerError) {
+        throw new Error("Could not parse extracted JSON block");
+      }
+    }
+    throw e;
+  }
+};
+
+// --- API Calls wrapped with withRetry ---
+
+export const getSearchSuggestions = async (query: string): Promise<string[]> => {
+  if (!query || query.length < 2) return [];
+
+  return withRetry(async () => {
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: `Suggest 6-8 popular travel landmarks or cities that match: "${query}". Return as a raw JSON array of strings.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: { type: Type.ARRAY, items: { type: Type.STRING } },
+      }
+    });
+    return extractJSON(response.text || "[]");
+  });
+};
+
+export const analyzeLandmarkImage = async (base64Image: string): Promise<LandmarkData> => {
+  const base64Data = base64Image.includes("base64,") ? base64Image.split("base64,")[1] : base64Image;
+
+  return withRetry(async () => {
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: {
+        parts: [
+          { inlineData: { mimeType: "image/jpeg", data: base64Data } },
+          { text: "Identify this landmark. Return JSON with name, city, country, confidence (0-100), description, and 5-6 bullet points." }
+        ]
+      },
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: landmarkSchema,
+      }
+    });
+
+    const data = extractJSON(response.text || "{}");
+    return {
+      landmarkName: data.landmarkName || "Unknown",
+      alternativeNames: data.alternativeNames || [],
+      possibleLocations: data.possibleLocations || [],
+      city: data.city || "Unknown",
+      country: data.country || "Unknown",
+      confidenceScore: data.confidenceScore || 0,
+      description: data.description || "No description available.",
+      descriptionPoints: data.descriptionPoints || [],
+      tags: data.tags || [],
+      imageBase64: base64Image,
+    };
+  });
+};
+
+export const searchLandmarkByName = async (name: string): Promise<LandmarkData> => {
+  return withRetry(async () => {
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: `Detail the landmark: "${name}". Identify city and country. Return JSON with confidence score, description, and 5-6 points.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: landmarkSchema,
+      }
+    });
+
+    const data = extractJSON(response.text || "{}");
+    const generatedImgUrl = `https://image.pollinations.ai/prompt/photorealistic landmark ${encodeURIComponent(data.landmarkName || name)} ${encodeURIComponent(data.city || '')}?width=1200&height=800&nologo=true`;
+
+    return {
+      landmarkName: data.landmarkName || name,
+      alternativeNames: data.alternativeNames || [],
+      possibleLocations: data.possibleLocations || [],
+      city: data.city || "Unknown",
+      country: data.country || "Unknown",
+      confidenceScore: data.confidenceScore || 0,
+      description: data.description || "No description available.",
+      descriptionPoints: data.descriptionPoints || [],
+      tags: data.tags || [],
+      imageBase64: generatedImgUrl,
+    };
+  });
+};
+
+export const fetchHistory = async (landmark: string, city: string, country: string): Promise<HistoryData> => {
+  return withRetry(async () => {
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: `Provide history of: ${landmark} in ${city}, ${country}. Return JSON summary, historyPoints, and funFacts.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: historySchema,
+      }
+    });
+    return extractJSON(response.text || "{}") as HistoryData;
+  });
+};
+
+export const fetchNearbyPlaces = async (landmark: string, city: string, country: string): Promise<NearbyPlace[]> => {
+  return withRetry(async () => {
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: `5-8 real nearby attractions around: ${landmark} in ${city}, ${country}. Return a JSON array.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: nearbySchema,
+      }
+    });
+    return extractJSON(response.text || "[]") as NearbyPlace[];
+  });
+};
+
+export const fetchTopAttractions = async (city: string, country: string): Promise<Attraction[]> => {
+  return withRetry(async () => {
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: `5-6 top rated tourist attractions in ${city}, ${country}. Return JSON array.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: attractionsSchema,
+      }
+    });
+    return extractJSON(response.text || "[]") as Attraction[];
+  });
+};
+
+export const fetchCulture = async (city: string, country: string): Promise<CultureData> => {
+  return withRetry(async () => {
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: `Cuisine and culture of ${city}, ${country}. Return JSON.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: cultureSchema,
+      }
+    });
+    return extractJSON(response.text || "{}") as CultureData;
+  });
+};
+
+export const generateItinerary = async (
+  landmark: string,
+  city: string,
+  startTime: string,
+  endTime: string,
+  numDays: number,
+  interests: string[],
+  mustVisit: string = "",
+  includeHiddenGems: boolean = false
+): Promise<ItineraryData> => {
+  return withRetry(async () => {
+    const prompt = `Plan ${numDays} days in ${city}. Start: ${landmark}. Window: ${startTime}-${endTime}. Interests: ${interests.join(",")}. Hidden Gems: ${includeHiddenGems}. Return JSON.`;
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: itinerarySchema,
+      }
+    });
+    return extractJSON(response.text || "{}") as ItineraryData;
+  });
+};
+
+export const fetchEvents = async (city: string, country: string): Promise<EventData> => {
+  return withRetry(async () => {
+    const prompt = `Current events in ${city}, ${country}. Return JSON categories.`;
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: prompt,
+      config: { tools: [{ googleSearch: {} }] },
+    });
+    const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks?.map((chunk: any) => 
+      chunk.web?.uri && chunk.web?.title ? { title: chunk.web.title, url: chunk.web.uri } : null
+    ).filter((s: any) => s !== null) || [];
+    let parsedData = { categories: [] };
+    try { parsedData = extractJSON(response.text || "{}"); } catch (e) {}
+    return { categories: parsedData.categories || [], sources };
+  });
+};
+
+export const fetchLogistics = async (city: string, country: string): Promise<LogisticsData> => {
+  return withRetry(async () => {
+    const prompt = `Transport and hotels in ${city}, ${country}. Return JSON.`;
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: prompt,
+      config: { tools: [{ googleSearch: {} }] }
+    });
+    let data: Partial<LogisticsData> = {};
+    try { data = extractJSON(response.text || "{}"); } catch (e) {}
+    return {
+      cabs: data.cabs || [],
+      rentals: data.rentals || [],
+      hotels: data.hotels || { luxury: [], midRange: [], budget: [] },
+    };
+  });
+};
+
+export const exploreTopic = async (topic: string, context: string, city: string = ""): Promise<DeepDiveData> => {
+  return withRetry(async () => {
+    const prompt = `Deep dive: "${topic}" in ${city}. Return JSON.`;
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: deepDiveSchema,
+      }
+    });
+    return extractJSON(response.text || "{}") as DeepDiveData;
+  });
+};
 
 // --- Schemas ---
-
-const landmarkSchema: Schema = {
+const landmarkSchema = {
   type: Type.OBJECT,
   properties: {
     landmarkName: { type: Type.STRING },
@@ -16,15 +263,14 @@ const landmarkSchema: Schema = {
     possibleLocations: { type: Type.ARRAY, items: { type: Type.STRING } },
     city: { type: Type.STRING },
     country: { type: Type.STRING },
-    confidenceScore: { type: Type.NUMBER, description: "A score between 0 and 100 indicating confidence" },
+    confidenceScore: { type: Type.NUMBER },
     description: { type: Type.STRING },
-    descriptionPoints: { type: Type.ARRAY, items: { type: Type.STRING }, description: "5-6 interesting bullet points describing the landmark visually and historically." },
+    descriptionPoints: { type: Type.ARRAY, items: { type: Type.STRING } },
     tags: { type: Type.ARRAY, items: { type: Type.STRING } },
   },
-  required: ["landmarkName", "city", "country", "confidenceScore", "description", "descriptionPoints"],
 };
 
-const historySchema: Schema = {
+const historySchema = {
   type: Type.OBJECT,
   properties: {
     summary: { type: Type.STRING },
@@ -36,15 +282,13 @@ const historySchema: Schema = {
           title: { type: Type.STRING },
           content: { type: Type.STRING },
         },
-        required: ["title", "content"],
       },
     },
     funFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
   },
-  required: ["summary", "historyPoints", "funFacts"],
 };
 
-const nearbySchema: Schema = {
+const nearbySchema = {
   type: Type.ARRAY,
   items: {
     type: Type.OBJECT,
@@ -54,13 +298,12 @@ const nearbySchema: Schema = {
       distanceKm: { type: Type.NUMBER },
       approxTimeMinutes: { type: Type.NUMBER },
       shortDescription: { type: Type.STRING },
-      openingHours: { type: Type.STRING, description: "Opening and closing times, e.g., '9:00 AM - 6:00 PM' or 'Open 24 hours'. If unknown, estimate or say 'Check locally'." },
+      openingHours: { type: Type.STRING },
     },
-    required: ["placeName", "category", "distanceKm", "shortDescription", "openingHours"],
   },
 };
 
-const attractionsSchema: Schema = {
+const attractionsSchema = {
   type: Type.ARRAY,
   items: {
     type: Type.OBJECT,
@@ -72,36 +315,44 @@ const attractionsSchema: Schema = {
       rating: { type: Type.STRING },
       locationType: { type: Type.STRING },
     },
-    required: ["name", "openingHours", "suggestedDuration"],
   },
 };
 
-const itinerarySchema: Schema = {
+const itinerarySchema = {
   type: Type.OBJECT,
   properties: {
     title: { type: Type.STRING },
-    totalDuration: { type: Type.STRING },
-    steps: {
+    totalDays: { type: Type.NUMBER },
+    days: {
       type: Type.ARRAY,
       items: {
         type: Type.OBJECT,
         properties: {
-          stepTitle: { type: Type.STRING },
-          placeName: { type: Type.STRING },
-          startTime: { type: Type.STRING, description: "Start time of activity e.g., '09:00 AM'" },
-          endTime: { type: Type.STRING, description: "End time of activity e.g., '10:30 AM'" },
-          durationMinutes: { type: Type.NUMBER },
-          whyVisit: { type: Type.STRING },
-          tip: { type: Type.STRING },
+          dayNumber: { type: Type.NUMBER },
+          dayTitle: { type: Type.STRING },
+          steps: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                stepTitle: { type: Type.STRING },
+                placeName: { type: Type.STRING },
+                startTime: { type: Type.STRING },
+                endTime: { type: Type.STRING },
+                durationMinutes: { type: Type.NUMBER },
+                whyVisit: { type: Type.STRING },
+                tip: { type: Type.STRING },
+                isHiddenGem: { type: Type.BOOLEAN },
+              },
+            },
+          },
         },
-        required: ["stepTitle", "placeName", "startTime", "endTime", "durationMinutes", "whyVisit"],
       },
     },
   },
-  required: ["title", "steps"],
 };
 
-const cultureSchema: Schema = {
+const cultureSchema = {
   type: Type.OBJECT,
   properties: {
     culinaryHighlights: {
@@ -117,10 +368,9 @@ const cultureSchema: Schema = {
     culturalEtiquette: { type: Type.ARRAY, items: { type: Type.STRING } },
     localTraditions: { type: Type.ARRAY, items: { type: Type.STRING } },
   },
-  required: ["culinaryHighlights", "culturalEtiquette", "localTraditions"],
 };
 
-const deepDiveSchema: Schema = {
+const deepDiveSchema = {
   type: Type.OBJECT,
   properties: {
     topic: { type: Type.STRING },
@@ -129,261 +379,4 @@ const deepDiveSchema: Schema = {
     bestPlaces: { type: Type.ARRAY, items: { type: Type.STRING } },
     relatedInfo: { type: Type.ARRAY, items: { type: Type.STRING } },
   },
-  required: ["topic", "details"],
-};
-
-// --- API Calls ---
-
-export const analyzeLandmarkImage = async (base64Image: string): Promise<LandmarkData> => {
-  const base64Data = base64Image.includes("base64,") 
-    ? base64Image.split("base64,")[1] 
-    : base64Image;
-
-  const response = await ai.models.generateContent({
-    model: modelId,
-    contents: {
-      parts: [
-        {
-          inlineData: {
-            mimeType: "image/jpeg",
-            data: base64Data,
-          },
-        },
-        {
-          text: `You are an advanced landmark recognition AI. Analyze the uploaded image.
-                 Return results in JSON format.
-                 If unsure, set confidenceScore below 50.
-                 Provide a description, city, and country.
-                 Also provide 'descriptionPoints' which is an array of 5-6 interesting bullet points describing the landmark visually and historically.`
-        }
-      ]
-    },
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: landmarkSchema,
-    }
-  });
-
-  const text = response.text || "{}";
-  const data = JSON.parse(text) as Partial<LandmarkData>;
-
-  return {
-    landmarkName: data.landmarkName || "Unknown",
-    alternativeNames: data.alternativeNames || [],
-    possibleLocations: data.possibleLocations || [],
-    city: data.city || "Unknown",
-    country: data.country || "Unknown",
-    confidenceScore: data.confidenceScore || 0,
-    description: data.description || "No description available.",
-    descriptionPoints: data.descriptionPoints || [],
-    tags: data.tags || [],
-    imageBase64: base64Image,
-  };
-};
-
-export const fetchHistory = async (landmark: string, city: string, country: string): Promise<HistoryData> => {
-  const response = await ai.models.generateContent({
-    model: modelId,
-    contents: `Provide history of the landmark: ${landmark} in ${city}, ${country}.
-               Return JSON with summary, historyPoints (key events or architectural details as bullet points with titles), and funFacts.`,
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: historySchema,
-    }
-  });
-
-  const text = response.text || "{}";
-  return JSON.parse(text) as HistoryData;
-};
-
-export const fetchNearbyPlaces = async (landmark: string, city: string, country: string): Promise<NearbyPlace[]> => {
-  const response = await ai.models.generateContent({
-    model: modelId,
-    contents: `Generate a list of 5-8 real nearby attractions around: ${landmark} in ${city}, ${country}.
-               Include openingHours for each place (e.g. 9 AM - 5 PM).
-               Return a JSON array of objects.`,
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: nearbySchema,
-    }
-  });
-
-  const text = response.text || "[]";
-  return JSON.parse(text) as NearbyPlace[];
-};
-
-export const fetchTopAttractions = async (city: string, country: string): Promise<Attraction[]> => {
-  const response = await ai.models.generateContent({
-    model: modelId,
-    contents: `List 5-6 top rated tourist attractions in ${city}, ${country}.
-               For each, provide:
-               - name
-               - openingHours (e.g. 9 AM - 6 PM)
-               - suggestedDuration (e.g. 1-2 hours)
-               - rating (e.g. 4.5)
-               - locationType (e.g. Museum, Park)
-               Return JSON array.`,
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: attractionsSchema,
-    }
-  });
-
-  const text = response.text || "[]";
-  return JSON.parse(text) as Attraction[];
-};
-
-export const fetchCulture = async (city: string, country: string): Promise<CultureData> => {
-  const response = await ai.models.generateContent({
-    model: modelId,
-    contents: `Describe the authentic cuisine and culture of ${city}, ${country}.
-               Return JSON with culinaryHighlights (name, description), culturalEtiquette, and localTraditions.`,
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: cultureSchema,
-    }
-  });
-
-  const text = response.text || "{}";
-  return JSON.parse(text) as CultureData;
-};
-
-export const generateItinerary = async (
-  landmark: string,
-  city: string,
-  startTime: string,
-  endTime: string,
-  interests: string[]
-): Promise<ItineraryData> => {
-  const prompt = `Create a personalized, time-specific travel itinerary.
-    Landmark: ${landmark}
-    City: ${city}
-    Start Time: ${startTime}
-    End Time: ${endTime}
-    Interests: ${interests.join(", ")}
-    
-    CRITICAL INSTRUCTIONS:
-    1. Start the itinerary strictly at ${startTime}.
-    2. End the itinerary by or before ${endTime}.
-    3. Provide specific 'startTime' and 'endTime' for each step.
-    4. Ensure the timeline respects typical opening hours.
-    5. Start with the main landmark provided if it fits the time.
-    
-    Return JSON.`;
-
-  const response = await ai.models.generateContent({
-    model: modelId,
-    contents: prompt,
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: itinerarySchema,
-    }
-  });
-
-  const text = response.text || "{}";
-  return JSON.parse(text) as ItineraryData;
-};
-
-export const fetchEvents = async (city: string, country: string): Promise<EventData> => {
-  // Uses Google Search to find real-time events.
-  const response = await ai.models.generateContent({
-    model: modelId,
-    contents: `Find the latest upcoming events, festivals, concerts, and exhibitions in ${city}, ${country} happening this month. 
-               
-               Return a valid JSON object. 
-               Structure: {
-                 "categories": [
-                   {
-                     "categoryName": "Music" | "Art" | "Sports" | "Festivals",
-                     "events": [
-                       { "title": "Event Name", "date": "Date Time", "location": "Venue", "description": "Short desc", "mapQuery": "Location Name City" }
-                     ]
-                   }
-                 ]
-               }
-               Do not use Markdown formatting in the response. Return raw JSON.`,
-    config: {
-      tools: [{ googleSearch: {} }],
-    },
-  });
-
-  // Extract grounding metadata (sources)
-  const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks
-    ?.map((chunk: any) => {
-      if (chunk.web?.uri && chunk.web?.title) {
-        return { title: chunk.web.title, url: chunk.web.uri };
-      }
-      return null;
-    })
-    .filter((s: any) => s !== null) || [];
-
-  let parsedData = { categories: [] };
-  try {
-    const text = response.text?.replace(/```json/g, '').replace(/```/g, '') || "{}";
-    parsedData = JSON.parse(text);
-  } catch (e) {
-    console.error("Failed to parse events JSON", e);
-  }
-
-  return {
-    categories: parsedData.categories || [],
-    sources: sources,
-  };
-};
-
-export const fetchLogistics = async (city: string, country: string): Promise<LogisticsData> => {
-  const prompt = `Find travel logistics for ${city}, ${country}.
-  1. List popular cab/taxi apps or services available.
-  2. List popular car rental agencies.
-  3. List recommended hotels categorized by "Luxury" (5-star), "MidRange" (4-star), and "Budget" (3-star).
-  
-  Return valid JSON with keys: cabs (string array), rentals (string array), hotels (object with luxury, midRange, budget arrays of objects {name, rating, description}).
-  Do not use Markdown.`;
-
-  const response = await ai.models.generateContent({
-    model: modelId,
-    contents: prompt,
-    config: {
-      tools: [{ googleSearch: {} }],
-      // Note: We use tools to get grounded info, but ask for JSON format text.
-    }
-  });
-
-  let data: Partial<LogisticsData> = {};
-  try {
-     const text = response.text?.replace(/```json/g, '').replace(/```/g, '') || "{}";
-     data = JSON.parse(text);
-  } catch (e) {
-     console.error("Failed to parse logistics JSON", e);
-  }
-
-  return {
-    cabs: data.cabs || [],
-    rentals: data.rentals || [],
-    hotels: data.hotels || { luxury: [], midRange: [], budget: [] },
-  };
-};
-
-export const exploreTopic = async (topic: string, context: string, city: string = ""): Promise<DeepDiveData> => {
-  const prompt = `The user is interested in "${topic}" related to "${context}"${city ? ` in or near ${city}` : ""}.
-  Provide a deep dive using bullet points.
-  
-  CRITICAL: If it's a food item, provide 'bestPlaces' (famous spots to try it **specifically in ${city}**) and 'details' (ingredients/history).
-  If it's a craft or clothing (like shawls), provide 'stylingTips' (how to wear/style it) and 'details' (origin/process).
-  If it's a tradition, provide 'relatedInfo' and 'details'.
-  
-  Do not suggest places in other cities unless absolutely necessary.
-  Return JSON.`;
-
-  const response = await ai.models.generateContent({
-    model: modelId,
-    contents: prompt,
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: deepDiveSchema,
-    }
-  });
-
-  const text = response.text || "{}";
-  return JSON.parse(text) as DeepDiveData;
 };
